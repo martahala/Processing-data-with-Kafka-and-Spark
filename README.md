@@ -18,3 +18,6 @@ Features:
 •	Partitioning
 •	Checkpointing
 •	Replication mechanism
+
+
+The data is taken from https://www.kaggle.com/datasets/patrickfleith/controlled-anomalies-time-series-dataset. 
