@@ -1,0 +1,143 @@
+services:
+  #Zookeeper Service (using Bitnami's version)
+  zookeeper:
+    image: bitnami/zookeeper:latest
+    environment:
+      - ZOOKEEPER_CLIENT_PORT=2181 #Default client port for Zookeeper
+      - ZOOKEEPER_TICK_TIME=2000 #Tick time for Zookeeper (in milliseconds)
+      - ALLOW_ANONYMOUS_LOGIN=yes #Allow anonymous login
+    ports:
+      - "2181:2181"  #Expose Zookeeper port to the host machine for client connections
+    volumes:
+      - ./zookeeper_data:/bitnami/zookeeper/data:rw
+
+    networks:
+      - kafka_network #Connect Zookeeper to the Kafka network
+
+  # Kafka Service (using Bitnami's version)
+  kafka:
+    image: bitnami/kafka:latest
+    environment:
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181  #Connect Kafka to Zookeeper
+      - KAFKA_LISTENER_SECURITY_PROTOCOL=PLAINTEXT  #Use plaintext communication (no SSL)
+      - KAFKA_LISTENER_PORT=9092  #Kafka's default communication port
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092  #Advertise the internal Kafka listener to clients
+      - KAFKA_LISTENER_NAME=PLAINTEXT #Listener name for Kafka communication
+      - KAFKA_LISTENER_INSIDE_PORT=9092 #Internal listener port for Kafka
+      - KAFKA_LISTENER_INTERNAL=PLAINTEXT://kafka:9092 #Internal listener for communication within the container network
+      - KAFKA_NUM_PARTITIONS=3  #Number of partitions to use in Kafka
+      - KAFKA_REPLICATION_FACTOR=3  #Set replication factor for fault tolerance
+    ports:
+      - "9092:9092"  #Kafka default port for client communication
+    networks:
+      - kafka_network #Connect Kafka to the Kafka network
+    deploy:
+      replicas: 3  #Horizontal scaling: multiple Kafka broker instances
+  
+
+  # Spark Master Service (using Bitnami's version 3.5.2)
+  pyspark-master:
+    image: bitnami/spark:3.5.2
+    environment:
+      - SPARK_MODE=master #Set Spark mode to master for coordinating the cluster
+      - SPARK_MASTER=spark://pyspark-master:7077 #URL for the Spark master node
+      - JAVA_HOME=/opt/bitnami/java #Path to Java home (required for Spark)
+      - SPARK_HOME=/opt/bitnami/spark #Path to Spark installation
+      - PYSPARK_PYTHON=python3 #Use Python 3 for PySpark
+    volumes: 
+      - ./data:/data #Mount data folder for sharing scripts/data
+    ports:
+      - "8080:8080" #Expose Spark Web UI for monitoring the Spark cluster
+    networks:
+      - kafka_network #Connect Spark Master to the Kafka network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"] #Health check using the Spark Web UI
+      interval: 30s  #Health check interval
+      retries: 3  #Number of retries before marking the service as unhealthy
+
+  # Spark Worker Service (using Bitnami's version 3.5.2)
+  pyspark-worker:
+    image: bitnami/spark:3.5.2
+    environment:
+      - SPARK_MODE=worker #Set Spark mode to worker to connect to the master
+      - SPARK_MASTER=spark://pyspark-master:7077 #Connect the worker to the Spark master node
+    volumes: 
+      - ./data:/data #Mount data folder for shared data/scripts
+    depends_on:
+      - pyspark-master #Ensure Spark worker starts after the Spark master is up
+    networks:
+      - kafka_network #Connect Spark Worker to the Kafka network
+    deploy:
+      replicas: 3 
+
+  #Ingestion Service 
+  ingestion-service:
+    build:
+      context: ./ingestion #Build the service from the ./ingestion directory
+    depends_on:
+      - kafka #Ensure Kafka is up before starting the ingestion service
+    environment:
+      - KAFKA_SERVER=kafka:9092  #Kafka server URL to produce messages
+    networks:
+      - kafka_network #Connect Ingestion Service to the Kafka network
+  
+ #Preprocessing Service
+  preprocessing:
+    image: bitnami/spark:3.5.2
+    environment:
+      - SPARK_MODE=client #Set Spark mode to client to run Spark jobs locally
+      - SPARK_MASTER=spark://pyspark-master:7077 #Connect to the Spark master
+      - JAVA_HOME=/opt/bitnami/java #Path to Java home for Spark
+      - SPARK_HOME=/opt/bitnami/spark #Path to Spark installation
+      - PYSPARK_PYTHON=python3 #Use Python 3 for PySpark
+    networks:
+      - kafka_network #Connect Preprocessing Service to the Kafka network
+    depends_on:
+      - kafka #Ensure Kafka is up before starting preprocessing
+      - pyspark-master #Ensure Spark master is available before preprocessing
+    volumes:
+      - ./data:/data  #Mount data folder for scripts in ./data  
+    command: 
+      - spark-submit #Submit a Spark job
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.2,org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.2  #Include necessary packages for Kafka integration in Spark
+      - /data/preprocessing-service.py #Specify the preprocessing script to run
+
+  #Aggregation Service 
+  aggregation:
+    image: bitnami/spark:3.5.2
+    environment:
+      - SPARK_MODE=client #Set Spark mode to client for job execution
+      - SPARK_MASTER=spark://pyspark-master:7077 #Connect to the Spark master
+      - JAVA_HOME=/opt/bitnami/java #Java home path for Spark
+      - SPARK_HOME=/opt/bitnami/spark #Spark installation path
+      - PYSPARK_PYTHON=python3 #Use Python 3 for PySpark
+    networks:
+      - kafka_network #Connect Aggregation Service to Kafka network
+    depends_on:
+      - kafka #Ensure Kafka is up before starting aggregation
+      - pyspark-master #Ensure Spark master is available before aggregation
+    volumes:
+      - ./data:/data  #Mount data folder for scripts in ./data
+    command: 
+      - spark-submit #Submit Spark job
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.2,org.apache.spark:spark-streaming-kafka-0-10_2.12:3.5.2 #Include Kafka integration packages for Spark
+      - /data/aggregation-service.py #Specify the aggregation script to run
+    
+
+  #Delivery Service
+  delivery-service:
+    build:
+      context: ./delivery #Build the delivery service from the ./delivery directory
+    networks:
+      - kafka_network #Connect Delivery Service to Kafka network
+    depends_on:
+      - kafka #Ensure Kafka is available before delivery service starts
+
+#Define the network for the services to communicate
+networks:
+  kafka_network:
+    driver: bridge #Use bridge driver for inter-container communication
+
+    
